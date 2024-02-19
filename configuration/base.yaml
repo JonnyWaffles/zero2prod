@@ -7,3 +7,9 @@ database:
   username: "postgres"
   password: "password"
   database_name: "newsletter"
+
+email_client:
+  base_url: "https://api.postmarkapp.com"
+  sender_email: "something@gmail.com"
+  authorization_token: "fake-secret-token"
+  timeout_milliseconds: 10000
