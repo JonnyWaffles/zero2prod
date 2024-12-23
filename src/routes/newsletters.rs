@@ -91,12 +91,7 @@ pub async fn get_confirmed_subscribers(
     // Nesting its definition inside the function itself is a simple way
     // to clearly communicate this coupling (and to ensure it doesn't
     // get used elsewhere by mistake).
-    struct Row {
-        email: String,
-    }
-
-    let rows = sqlx::query_as!(
-        Row,
+    let rows = sqlx::query!(
         r#"
         select email
         from subscriptions
