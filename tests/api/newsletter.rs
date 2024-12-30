@@ -1,5 +1,4 @@
 use crate::helpers::{spawn_app, ConfirmationLinks, TestApp};
-use actix_web::App;
 use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -82,15 +81,34 @@ async fn newsletters_are_not_delivered_to_unconfirmed_subscribers() {
         }
     });
 
+    let response = app.post_newsletters(newsletter_request_body).await;
+
+    assert_eq!(response.status().as_u16(), 200);
+    // Mock verifies on Drop we have not sent the newsletter email
+}
+
+#[tokio::test]
+async fn requests_missing_authorization_are_rejected() {
+    let app = spawn_app().await;
+
     let response = reqwest::Client::new()
         .post(&format!("{}/newsletters", &app.address))
-        .json(&newsletter_request_body)
+        .json(&serde_json::json!({
+            "title": "Newsletter Title",
+            "content": {
+                "text": "Newsletter body as plain text",
+                "html": "<p>Newsletter body as HTML</p>",
+            }
+        }))
         .send()
         .await
         .expect("Failed to execute request.");
 
-    assert_eq!(response.status().as_u16(), 200);
-    // Mock verifies on Drop we have not sent the newsletter email
+    assert_eq!(401, response.status().as_u16());
+    assert_eq!(
+        r#"Basic realm="publish""#,
+        response.headers()["WWW-Authenticate"]
+    );
 }
 
 /// Use the public API of the application under test to create
