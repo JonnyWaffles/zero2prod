@@ -1,15 +1,14 @@
 use crate::domain::SubscriberEmail;
 use crate::email_client::EmailClient;
 use crate::routes::error_chain_fmt;
+use crate::telemetry::spawn_blocking_with_tracing;
 use actix_web::http::header::{HeaderMap, HeaderValue};
 use actix_web::http::{header, StatusCode};
 use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 use anyhow::Context;
-use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
-use argon2::password_hash::Salt;
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
 use secrecy::{ExposeSecret, Secret};
-use sha3::Digest;
 use sqlx::PgPool;
 
 #[derive(serde::Deserialize)]
@@ -83,8 +82,8 @@ pub async fn publish_newsletter(
     let user_id = validate_credentials(credentials, &pool).await?;
     tracing::Span::current().record("user_id", &tracing::field::display(&user_id));
 
-    let _subscribers = get_confirmed_subscribers(&pool).await?;
-    for subscriber in _subscribers {
+    let subscribers = get_confirmed_subscribers(&pool).await?;
+    for subscriber in subscribers {
         match subscriber {
             Ok(subscriber) => {
                 email_client
@@ -148,53 +147,84 @@ fn basic_authentication(headers: &HeaderMap) -> Result<Credentials, anyhow::Erro
     })
 }
 
+#[tracing::instrument(name = "Validate credentials", skip(credentials, pool))]
 async fn validate_credentials(
     credentials: Credentials,
     pool: &PgPool,
 ) -> Result<uuid::Uuid, PublishError> {
-    let hasher = Argon2::new(
-        Algorithm::Argon2id,
-        Version::V0x13,
-        Params::new(15000, 2, 1, None)
-            .context("Failed to build Argon2 parameters")
-            .map_err(PublishError::UnexpectedError)?,
+    // Placeholder credentials to prevent timing attacks
+    let mut user_id = None;
+    let mut expected_password_hash = Secret::new(
+        "$argon2id$v=19$m=15000,t=2,p=1$\
+        gZiV/M1gPc22ElAH/Jh1Hw$\
+        CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+            .to_string(),
     );
 
+    if let Some((stored_user_id, stored_password_hash)) =
+        get_stored_credentials(&credentials.username, &pool)
+            .await
+            .map_err(PublishError::UnexpectedError)?
+    {
+        user_id = Some(stored_user_id);
+        expected_password_hash = stored_password_hash;
+    }
+
+    spawn_blocking_with_tracing(move || {
+        verify_password_hash(expected_password_hash, credentials.password)
+    })
+    .await
+    // spawn_blocking is fallible - we have a nested Result here!
+    .context("Failed to spawn blocking task.")
+    .map_err(PublishError::UnexpectedError)??;
+
+    // This is only set to `Some` if we found credentials in the store,
+    // so even if somehow the default password matched it would never auth
+    // an unknown user.
+    user_id.ok_or(PublishError::AuthError(anyhow::anyhow!(
+        "Unknown username."
+    )))
+}
+
+#[tracing::instrument(name = "Get stored credentials", skip(username, pool))]
+async fn get_stored_credentials(
+    username: &str,
+    pool: &PgPool,
+) -> Result<Option<(uuid::Uuid, Secret<String>)>, anyhow::Error> {
     let row: Option<_> = sqlx::query!(
         r#"
-        select user_id, password_hash, salt
+        select user_id, password_hash
         from users
         where username = $1
         "#,
-        credentials.username,
+        username,
     )
     .fetch_optional(pool)
     .await
-    .context("Failed to perform a query to retrieve stored credentials.")
-    .map_err(PublishError::UnexpectedError)?;
+    .context("Failed to perform a query to retrieve stored credentials.")?
+    .map(|row| (row.user_id, Secret::new(row.password_hash)));
+    Ok(row)
+}
 
-    let (expected_password_hash, user_id, salt) = match row {
-        Some(row) => (row.password_hash, row.user_id, row.salt),
-        None => {
-            return Err(PublishError::AuthError(anyhow::anyhow!(
-                "Unknown username."
-            )))
-        }
-    };
-
-    let password_hash = hasher
-        .hash_password(credentials.password.expose_secret().as_bytes(), &salt)
-        .context("Failed to hash password.")
+#[tracing::instrument(
+    name = "Verify password hash",
+    skip(expected_password_hash, password_candidate)
+)]
+fn verify_password_hash(
+    expected_password_hash: Secret<String>,
+    password_candidate: Secret<String>,
+) -> Result<(), PublishError> {
+    let expected_password_hash = PasswordHash::new(&expected_password_hash.expose_secret())
+        .context("Failed to parse hash in PHC string format.")
         .map_err(PublishError::UnexpectedError)?;
 
-    // Lowercase hexadecimal encoding.
-    let password_hash = format!("{:x}", password_hash.hash.unwrap());
-
-    if password_hash != expected_password_hash {
-        Err(PublishError::AuthError(anyhow::anyhow!("Invalid password.")))
-    } else {
-        Ok(user_id)
-    }
+    Argon2::default()
+        .verify_password(
+            password_candidate.expose_secret().as_bytes(),
+            &expected_password_hash,
+        )
+        .context("Invalid password.")
+        .map_err(PublishError::AuthError)
 }
 
 #[tracing::instrument(name = "Get confirmed subscribers", skip(pool))]
