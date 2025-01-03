@@ -1,8 +1,11 @@
 use crate::configuration::{DatabaseSettings, Settings};
 use crate::email_client::EmailClient;
-use crate::routes::{confirm, health_check, publish_newsletter, subscribe};
+use crate::routes::{
+    confirm, health_check, home, login, login_form, publish_newsletter, subscribe,
+};
 use actix_web::dev::Server;
 use actix_web::{web, App, HttpServer};
+use secrecy::Secret;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::net::TcpListener;
 use tracing_actix_web::TracingLogger;
@@ -15,6 +18,10 @@ pub struct Application {
 
 // We need this wrapper to play nice with the actix-web
 pub struct ApplicationBaseUrl(pub String);
+
+// Wrap the secret so it plays nice with the type dependency injection system
+#[derive(Clone)]
+pub struct HmacSecret(pub Secret<String>);
 
 impl Application {
     pub async fn build(configuration: Settings) -> Result<Self, std::io::Error> {
@@ -44,6 +51,7 @@ impl Application {
             connection_pool,
             email_client,
             configuration.application.base_url,
+            configuration.application.hmac_secret,
         )?;
 
         Ok(Self { port, server })
@@ -68,6 +76,7 @@ pub fn run(
     db_pool: PgPool,
     email_client: EmailClient,
     base_url: String,
+    hmac_secret: Secret<String>,
 ) -> Result<Server, std::io::Error> {
     // Wrap the pool using web::Data, which boils down to an Arc smart pointer
     let db_pool = web::Data::new(db_pool);
@@ -77,13 +86,17 @@ pub fn run(
     let server = HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())
+            .route("/", web::get().to(home))
             .route("/health_check", web::get().to(health_check))
+            .route("/login", web::get().to(login_form))
+            .route("/login", web::post().to(login))
+            .route("/newsletters", web::post().to(publish_newsletter))
             .route("/subscriptions", web::post().to(subscribe))
             .route("/subscriptions/confirm", web::get().to(confirm))
-            .route("/newsletters", web::post().to(publish_newsletter))
             .app_data(db_pool.clone())
             .app_data(email_client.clone())
             .app_data(base_url.clone())
+            .app_data(web::Data::new(HmacSecret(hmac_secret.clone())))
     })
     .listen(listener)?
     .run();
