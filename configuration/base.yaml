@@ -16,3 +16,5 @@ email_client:
   sender_email: "something@gmail.com"
   authorization_token: "fake-secret-token"
   timeout_milliseconds: 10000
+
+redis_uri: "redis://127.0.0.1:6379"
